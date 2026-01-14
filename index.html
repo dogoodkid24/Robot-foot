@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robo-Keeper Training & Online</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: 'Segoe UI', sans-serif; background: #111; color: white; }
+        
+        /* UI Overlays */
+        #menu-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.85); display: flex; flex-direction: column;
+            justify-content: center; align-items: center; z-index: 100;
+        }
+        .btn {
+            background: #3498db; border: none; padding: 15px 30px; color: white;
+            font-size: 1.2em; border-radius: 8px; cursor: pointer; margin: 10px;
+            transition: transform 0.2s, background 0.2s; min-width: 250px;
+        }
+        .btn:hover { background: #2980b9; transform: scale(1.05); }
+        .btn-secondary { background: #2ecc71; }
+        .btn-secondary:hover { background: #27ae60; }
+
+        #ui-hud {
+            position: absolute; top: 20px; left: 20px; pointer-events: none;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.8); z-index: 10; display: none;
+        }
+        #score-board { font-size: 2em; font-weight: bold; }
+        #room-info { font-size: 0.9em; opacity: 0.8; }
+
+        .instructions {
+            position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+            background: rgba(0,0,0,0.6); padding: 10px 20px; border-radius: 20px;
+            text-align: center; pointer-events: none; z-index: 10; font-size: 0.9em;
+        }
+
+        #power-container {
+            position: absolute; bottom: 80px; left: 50%; transform: translateX(-50%);
+            width: 200px; height: 12px; background: rgba(0,0,0,0.5);
+            border: 2px solid white; border-radius: 6px; display: none; overflow: hidden;
+        }
+        #power-bar { height: 100%; width: 0%; background: linear-gradient(to right, #2ecc71, #f1c40f, #e74c3c); }
+
+        #goal-message {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: #f1c40f; font-size: 5em; font-weight: 900; display: none;
+            text-transform: uppercase; -webkit-text-stroke: 1px black; z-index: 20;
+        }
+
+        #loading {
+            position: fixed; width: 100%; height: 100%; background: #222;
+            display: flex; justify-content: center; align-items: center; z-index: 200;
+        }
+        input {
+            padding: 10px; border-radius: 5px; border: none; margin: 10px; width: 230px; font-size: 1em;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading">Lade Stadion...</div>
+
+    <!-- START MENÜ -->
+    <div id="menu-overlay">
+        <h1>Fußball Training & Online</h1>
+        <button class="btn" onclick="startMode('training')">Einzeltraining (Robot)</button>
+        <div style="margin-top: 20px; border-top: 1px solid #444; padding-top: 20px;">
+            <input type="text" id="room-input" placeholder="Raum Name (z.B. Team123)">
+            <button class="btn btn-secondary" onclick="startMode('online')">Online Spiel beitreten</button>
+        </div>
+        <p style="font-size: 0.8em; color: #aaa;">Online: 1v1 bis 3v3 möglich</p>
+    </div>
+
+    <!-- HUD -->
+    <div id="ui-hud">
+        <div id="score-board">Heim 0 : 0 Gast</div>
+        <div id="room-info">Modus: Training</div>
+    </div>
+
+    <div id="power-container">
+        <div id="power-bar"></div>
+    </div>
+
+    <div id="goal-message">TOR!</div>
+
+    <div class="instructions">
+        <strong>WASD</strong>: Laufen | <strong>Maus</strong>: Zielen | <strong>F halten</strong>: Kraft | <strong>L</strong>: Ball (nur Training)
+    </div>
+
+    <!-- Libraries -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r152/three.min.js"></script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, updateDoc, deleteDoc, collection, getDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Globaler Status
+        let scene, camera, renderer, clock;
+        let player, ball, robot, targetMarker;
+        let otherPlayers = {}; // UID -> Mesh
+        let score = { home: 0, away: 0 };
+        let isBallPossessed = false;
+        let ballVelocity; // Initialisierung in init()
+        let moveState = { forward: 0, back: 0, left: 0, right: 0 };
+        let mouse; // Initialisierung in init()
+        let raycaster; // Initialisierung in init()
+        
+        let isCharging = false;
+        let shotPower = 0;
+        let gameMode = 'menu'; // 'training' oder 'online'
+        let currentUser = null;
+        let currentRoomId = null;
+        let isHost = false;
+
+        const PLAYER_SPEED = 0.12;
+        const BALL_FRICTION = 0.985;
+        const ROBOT_SPEED = 0.05;
+
+        // Firebase Setup
+        const firebaseConfig = JSON.parse(window.__firebase_config || '{}');
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-soccer';
+        let db, auth;
+
+        async function initFirebase() {
+            if (!firebaseConfig.apiKey) {
+                console.warn("Keine Firebase-Konfiguration gefunden. Online-Modus deaktiviert.");
+                return;
+            }
+            const app = initializeApp(firebaseConfig);
+            auth = getAuth(app);
+            db = getFirestore(app);
+            await signInAnonymously(auth);
+            onAuthStateChanged(auth, (user) => {
+                currentUser = user;
+                if (user) console.log("Eingeloggt als", user.uid);
+            });
+        }
+
+        // Start-Logik
+        window.startMode = function(mode) {
+            gameMode = mode;
+            if (mode === 'online') {
+                const roomInput = document.getElementById('room-input').value.trim();
+                currentRoomId = roomInput || 'Lobby';
+                document.getElementById('room-info').innerText = "Raum: " + currentRoomId;
+                joinOnlineRoom();
+            } else {
+                document.getElementById('room-info').innerText = "Modus: Training";
+                if (robot) robot.visible = true;
+            }
+            document.getElementById('menu-overlay').style.display = 'none';
+            document.getElementById('ui-hud').style.display = 'block';
+        };
+
+        async function joinOnlineRoom() {
+            if (!currentUser) return;
+            if (robot) robot.visible = false;
+
+            const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', currentRoomId);
+            const roomSnap = await getDoc(roomRef);
+            
+            if (!roomSnap.exists()) {
+                isHost = true;
+                await setDoc(roomRef, { 
+                    ballX: 0, ballZ: 0, ballVX: 0, ballVZ: 0, 
+                    scoreHome: 0, scoreAway: 0, hostUid: currentUser.uid 
+                });
+            }
+
+            // Spieler synchronisieren
+            const playersCol = collection(db, 'artifacts', appId, 'public', 'data', 'rooms', currentRoomId, 'players');
+            await setDoc(doc(playersCol, currentUser.uid), {
+                x: 0, z: 10, rot: 0, team: 'home', lastUpdate: Date.now()
+            });
+
+            // Raumdaten abhören (Ball & Spielstand)
+            onSnapshot(roomRef, (snap) => {
+                const data = snap.data();
+                if (!data) return;
+                score.home = data.scoreHome;
+                score.away = data.scoreAway;
+                updateScoreUI();
+                
+                if (!isHost && !isBallPossessed) {
+                    ball.position.x = data.ballX;
+                    ball.position.z = data.ballZ;
+                    if (ballVelocity) ballVelocity.set(data.ballVX, 0, data.ballVZ);
+                }
+                if (data.hostUid === currentUser.uid) isHost = true;
+            }, (error) => console.error("Snapshot Fehler:", error));
+
+            // Andere Spieler abhören
+            onSnapshot(playersCol, (snap) => {
+                snap.docChanges().forEach(change => {
+                    const data = change.doc.data();
+                    const uid = change.doc.id;
+                    if (uid === currentUser.uid) return;
+
+                    if (change.type === "added" || change.type === "modified") {
+                        updateRemotePlayer(uid, data);
+                    } else if (change.type === "removed") {
+                        if (otherPlayers[uid]) {
+                            scene.remove(otherPlayers[uid]);
+                            delete otherPlayers[uid];
+                        }
+                    }
+                });
+            }, (error) => console.error("Player Snapshot Fehler:", error));
+        }
+
+        function updateRemotePlayer(uid, data) {
+            if (!otherPlayers[uid]) {
+                const group = new THREE.Group();
+                const color = data.team === 'home' ? 0x3498db : 0xe74c3c;
+                const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.4, 1, 4, 8), new THREE.MeshPhongMaterial({ color }));
+                body.position.y = 0.9;
+                group.add(body);
+                scene.add(group);
+                otherPlayers[uid] = group;
+            }
+            otherPlayers[uid].position.x = data.x;
+            otherPlayers[uid].position.z = data.z;
+            otherPlayers[uid].rotation.y = data.rot;
+        }
+
+        // Three.js initialisieren
+        function init() {
+            // Initialisierung erst hier, wenn THREE sicher geladen ist
+            ballVelocity = new THREE.Vector3(0, 0, 0);
+            mouse = new THREE.Vector2();
+            raycaster = new THREE.Raycaster();
+            clock = new THREE.Clock();
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x222222);
+            scene.fog = new THREE.Fog(0x222222, 30, 80);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 10, 15);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            document.body.appendChild(renderer.domElement);
+            
+            createEnvironment();
+            createEntities();
+
+            window.addEventListener('keydown', e => handleKey(e.code, 1));
+            window.addEventListener('keyup', e => handleKey(e.code, 0));
+            window.addEventListener('mousemove', onMouseMove);
+            window.addEventListener('resize', onResize);
+
+            document.getElementById('loading').style.display = 'none';
+            animate();
+        }
+
+        function createEnvironment() {
+            // Kleines Trainingsfeld
+            const grassGeo = new THREE.PlaneGeometry(30, 40);
+            const grassMat = new THREE.MeshPhongMaterial({ color: 0x27ae60 });
+            const grass = new THREE.Mesh(grassGeo, grassMat);
+            grass.rotation.x = -Math.PI / 2;
+            grass.receiveShadow = true;
+            scene.add(grass);
+
+            // Banden
+            const wallMat = new THREE.MeshPhongMaterial({ color: 0x333333 });
+            const walls = new THREE.Group();
+            const w1 = new THREE.Mesh(new THREE.BoxGeometry(32, 1, 1), wallMat);
+            w1.position.set(0, 0.5, 20.5);
+            const w2 = new THREE.Mesh(new THREE.BoxGeometry(32, 1, 1), wallMat);
+            w2.position.set(0, 0.5, -20.5);
+            const w3 = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 42), wallMat);
+            w3.position.set(15.5, 0.5, 0);
+            const w4 = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 42), wallMat);
+            w4.position.set(-15.5, 0.5, 0);
+            walls.add(w1, w2, w3, w4);
+            scene.add(walls);
+
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
+            scene.add(ambientLight);
+
+            const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+            sun.position.set(10, 30, 10);
+            sun.castShadow = true;
+            scene.add(sun);
+
+            // Tore
+            const goalGeo = new THREE.BoxGeometry(6, 3, 0.2);
+            const goalMat = new THREE.MeshPhongMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 });
+            
+            const goalHome = new THREE.Group();
+            const net = new THREE.Mesh(goalGeo, goalMat);
+            net.position.y = 1.5;
+            goalHome.add(net);
+            goalHome.position.z = -19.8;
+            scene.add(goalHome);
+
+            const goalAway = goalHome.clone();
+            goalAway.position.z = 19.8;
+            scene.add(goalAway);
+
+            const markerGeo = new THREE.RingGeometry(0.3, 0.4, 32);
+            const markerMat = new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.DoubleSide });
+            targetMarker = new THREE.Mesh(markerGeo, markerMat);
+            targetMarker.position.y = 1.5;
+            scene.add(targetMarker);
+        }
+
+        function createEntities() {
+            player = new THREE.Group();
+            const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.4, 1, 4, 8), new THREE.MeshPhongMaterial({ color: 0x3498db }));
+            body.position.y = 0.9;
+            body.castShadow = true;
+            player.add(body);
+            player.position.set(0, 0, 10);
+            scene.add(player);
+
+            ball = new THREE.Mesh(new THREE.SphereGeometry(0.28, 16, 16), new THREE.MeshPhongMaterial({ color: 0xffffff }));
+            ball.castShadow = true;
+            ball.position.set(0, 0.28, 0);
+            scene.add(ball);
+
+            robot = new THREE.Group();
+            const rBody = new THREE.Mesh(new THREE.BoxGeometry(1, 1.5, 0.5), new THREE.MeshPhongMaterial({ color: 0x7f8c8d }));
+            rBody.position.y = 0.75;
+            robot.add(rBody);
+            robot.position.set(0, 0, -19);
+            scene.add(robot);
+            robot.visible = false;
+        }
+
+        function handleKey(code, val) {
+            switch(code) {
+                case 'KeyW': case 'ArrowUp': moveState.forward = val; break;
+                case 'KeyS': case 'ArrowDown': moveState.back = val; break;
+                case 'KeyA': case 'ArrowLeft': moveState.left = val; break;
+                case 'KeyD': case 'ArrowRight': moveState.right = val; break;
+                case 'KeyL': if (gameMode === 'training') spawnBall(); break;
+                case 'KeyF': 
+                    if (isBallPossessed && val === 1) {
+                        isCharging = true;
+                        shotPower = 0;
+                        document.getElementById('power-container').style.display = 'block';
+                    } else if (val === 0 && isCharging) {
+                        shoot();
+                        isCharging = false;
+                        document.getElementById('power-container').style.display = 'none';
+                    }
+                    break;
+            }
+        }
+
+        function onMouseMove(e) {
+            if (!mouse) return;
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+        }
+
+        function onResize() {
+            if (!camera || !renderer) return;
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function spawnBall() {
+            if (!ball || !ballVelocity) return;
+            isBallPossessed = true;
+            ballVelocity.set(0, 0, 0);
+        }
+
+        function shoot() {
+            if (!ballVelocity || !targetMarker) return;
+            const dir = new THREE.Vector3().subVectors(targetMarker.position, ball.position).normalize();
+            const force = 0.3 + (shotPower * 0.7);
+            ballVelocity.copy(dir).multiplyScalar(force);
+            isBallPossessed = false;
+            
+            if (gameMode === 'online' && currentUser) {
+                // Andere über Schuss benachrichtigen
+                updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', currentRoomId), {
+                    ballVX: ballVelocity.x, ballVZ: ballVelocity.z
+                });
+            }
+        }
+
+        function updateScoreUI() {
+            document.getElementById('score-board').innerText = `Heim ${score.home} : ${score.away} Gast`;
+        }
+
+        function scored(team) {
+            if (team === 'home') score.home++; else score.away++;
+            updateScoreUI();
+            
+            const msg = document.getElementById('goal-message');
+            msg.style.display = 'block';
+            setTimeout(() => { if (msg) msg.style.display = 'none'; }, 1500);
+
+            if (gameMode === 'online' && isHost) {
+                updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', currentRoomId), {
+                    scoreHome: score.home, scoreAway: score.away
+                });
+            }
+            
+            isBallPossessed = false;
+            ball.position.set(0, 0.28, 0);
+            if (ballVelocity) ballVelocity.set(0, 0, 0);
+            player.position.set(0, 0, 10);
+        }
+
+        async function syncOnlineState() {
+            if (!currentUser || !currentRoomId) return;
+            const playerRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', currentRoomId, 'players', currentUser.uid);
+            await updateDoc(playerRef, {
+                x: player.position.x, z: player.position.z, rot: player.rotation.y, lastUpdate: Date.now()
+            });
+
+            if (isHost && !isBallPossessed) {
+                const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', currentRoomId);
+                await updateDoc(roomRef, {
+                    ballX: ball.position.x, ballZ: ball.position.z,
+                    ballVX: ballVelocity.x, ballVZ: ballVelocity.z
+                });
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            if (!clock) return;
+            const dt = clock.getDelta();
+
+            if (gameMode !== 'menu') {
+                // Spieler Bewegung
+                const mx = moveState.right - moveState.left;
+                const mz = moveState.back - moveState.forward;
+                if (mx !== 0 || mz !== 0) {
+                    const vec = new THREE.Vector3(mx, 0, mz).normalize().multiplyScalar(PLAYER_SPEED);
+                    player.position.add(vec);
+                    player.rotation.y = Math.atan2(mx, mz);
+                }
+                player.position.x = Math.max(-14.5, Math.min(14.5, player.position.x));
+                player.position.z = Math.max(-19.5, Math.min(19.5, player.position.z));
+
+                // Kamera
+                camera.position.lerp(new THREE.Vector3(player.position.x, 8, player.position.z + 10), 0.1);
+                camera.lookAt(player.position.x, 0, player.position.z - 2);
+
+                // Ball
+                if (isBallPossessed) {
+                    const offset = new THREE.Vector3(0, 0.28, -0.7).applyQuaternion(player.quaternion);
+                    ball.position.lerp(player.position.clone().add(offset), 0.3);
+                } else {
+                    ball.position.add(ballVelocity);
+                    ballVelocity.multiplyScalar(BALL_FRICTION);
+                    
+                    // Ball Kollisionen (Wände)
+                    if (Math.abs(ball.position.x) > 14.7) ballVelocity.x *= -0.7;
+                    if (Math.abs(ball.position.z) > 19.7) {
+                        // Tor Check
+                        if (Math.abs(ball.position.x) < 3) {
+                            scored(ball.position.z < 0 ? 'home' : 'away');
+                        } else {
+                            ballVelocity.z *= -0.7;
+                            ball.position.z = Math.sign(ball.position.z) * 19.7;
+                        }
+                    }
+                    
+                    // Ball stehlen Check
+                    if (player.position.distanceTo(ball.position) < 1.0) isBallPossessed = true;
+                }
+
+                // Robot (Training)
+                if (gameMode === 'training' && robot && robot.visible) {
+                    let tx = ball.position.x;
+                    tx = Math.max(-2.5, Math.min(2.5, tx));
+                    const rdx = tx - robot.position.x;
+                    robot.position.x += Math.sign(rdx) * Math.min(Math.abs(rdx), ROBOT_SPEED);
+                    if (robot.position.distanceTo(ball.position) < 1.2) {
+                        const bounce = ball.position.clone().sub(robot.position).normalize();
+                        ballVelocity.copy(bounce).multiplyScalar(0.3);
+                        isBallPossessed = false;
+                    }
+                }
+
+                // Zielen & Kraft
+                if (raycaster && camera && mouse) {
+                    raycaster.setFromCamera(mouse, camera);
+                    const planeZ = new THREE.Plane(new THREE.Vector3(0, 0, 1), 20);
+                    const intersect = new THREE.Vector3();
+                    if (raycaster.ray.intersectPlane(planeZ, intersect)) {
+                        targetMarker.position.x = Math.max(-3, Math.min(3, intersect.x));
+                        targetMarker.position.y = Math.max(0.3, Math.min(3, intersect.y));
+                        targetMarker.position.z = -19.9;
+                    }
+                }
+                if (isCharging) {
+                    shotPower = Math.min(1, shotPower + 0.02);
+                    const pBar = document.getElementById('power-bar');
+                    if (pBar) pBar.style.width = (shotPower * 100) + '%';
+                }
+
+                if (gameMode === 'online' && clock.elapsedTime % 0.1 < dt) {
+                    syncOnlineState();
+                }
+            }
+
+            if (renderer && scene && camera) {
+                renderer.render(scene, camera);
+            }
+        }
+
+        initFirebase().then(init);
+    </script>
+</body>
+</html>
